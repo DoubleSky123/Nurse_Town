@@ -1,0 +1,246 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.Networking;
+using System.Text;
+using Newtonsoft.Json.Linq;
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+public class OpenAIRequest : MonoBehaviour
+{
+    public static OpenAIRequest Instance; // Singleton instance
+    public string apiUrl = "https://api.openai.com/v1/chat/completions";
+    public string apiKey;
+    public string currentScenario = "Therapy"; // New scenario selector
+    private string currentPatientResponse = "";
+    public string lostResponse = "I......I.........no.........fast......";
+    public float maxSpeechSpeed = 170f;
+    private CharacterAnimationController animationController;
+    private BloodEffectController bloodEffectController;
+    private ScoringSystem scoringSystem = new ScoringSystem(); // For scoring system
+    private EmotionController emotionController;
+    private float currentSpeechSpeed;
+
+    private string basePath;
+    private List<string> patientInstructionsList;
+    private List<Dictionary<string, string>> chatMessages;
+
+    void Awake()
+    {
+        if (Instance == null)
+        {
+            Instance = this;
+            // Uncomment if you want this object to persist across scenes
+            // DontDestroyOnLoad(gameObject);
+        }
+        else
+        {
+            Destroy(gameObject);
+        }
+    }
+    private string LoadPromptFromFile(string fileName)
+    {
+        string filePath = Path.Combine(basePath, fileName);
+        if (!File.Exists(filePath))
+        {
+            Debug.LogError("Prompt file not found: " + filePath);
+            return "";
+        }
+        return File.ReadAllText(filePath);
+    }
+    void Start()
+    {
+        apiKey = EnvironmentLoader.GetEnvVariable("OPENAI_API_KEY");
+        basePath = Path.Combine(Application.streamingAssetsPath, "Prompts", currentScenario);
+        ScoreManager.Instance.Initialize(currentScenario);
+        // Initialize patient instructions and chat
+        InitializePatientInstructions();
+        InitializeChat();
+        animationController = GetComponent<CharacterAnimationController>();
+        bloodEffectController = GetComponent<BloodEffectController>();
+        emotionController = GetComponent<EmotionController>();
+        if (emotionController == null)
+        {
+            Debug.LogError("EmotionController component not found on the GameObject.");
+        }
+    }
+
+    private void InitializePatientInstructions()
+    {
+        string baseInstructions = LoadPromptFromFile("baseInstructions.txt");
+        string caseHistoryPrompt = LoadPromptFromFile("caseHistory.txt");
+        patientInstructionsList = new List<string>();
+
+        int randomIndex = 1;
+        string patientFile = $"patient{randomIndex}.txt";
+        string patientSpecific = LoadPromptFromFile(patientFile);
+
+        if (string.IsNullOrEmpty(patientSpecific))
+        {
+            Debug.LogError("Failed to load patient file: " + patientFile);
+        }
+        else
+        {
+            string fullPrompt = $"{baseInstructions}\n{caseHistoryPrompt}\n{patientSpecific}";
+            patientInstructionsList.Add(fullPrompt);
+        }
+        if (patientInstructionsList.Count == 0)
+        {
+            Debug.LogError("No patient instructions loaded for scenario: " + currentScenario);
+        }
+    }
+
+    private void InitializeChat()
+    {
+        string emotionInstructions = @"
+            IMPORTANT: You will analysis your emotion based on the conversation. Then end EVERY response with corresponding emotion codes:
+            - Use [0] for neutral responses or statements
+            - Use [1] for responses involving minor pain or discomfort
+            - Use [2] for positive responses, gratitude, or when feeling better
+            - Use [3] for pain
+            - Use [4] for sad
+            - Use [5] for anger or frustration";
+
+        // Randomly select a patient instruction
+        System.Random rand = new System.Random();
+        int patientIndex = rand.Next(patientInstructionsList.Count);
+        string selectedPatientInstructions = patientInstructionsList[patientIndex];
+
+        // Combine selected patient instructions with emotion instructions
+        chatMessages = new List<Dictionary<string, string>>()
+        {
+            new Dictionary<string, string>()
+            {
+                { "role", "system" },
+                { "content", $"{selectedPatientInstructions}\n\n{emotionInstructions}" }
+            }
+        };
+
+        PrintChatMessage(chatMessages);
+        StartCoroutine(PostRequest());
+    }
+
+    public void ReceiveNurseTranscription(string transcribedText, float speechWpm)
+    {
+        NurseResponds(transcribedText, speechWpm);
+    }
+
+    private void NurseResponds(string nurseMessage, float speechWpm)
+    {
+        chatMessages.Add(new Dictionary<string, string>() { { "role", "user" }, { "content", nurseMessage } });
+        PrintChatMessage(chatMessages);
+        currentSpeechSpeed = speechWpm;
+        Debug.Log("speech speed:" + currentSpeechSpeed);
+
+        StartCoroutine(PostRequest());
+
+        // Evaluate nurse's response
+        // scoringSystem.EvaluateNurseResponse(nurseMessage);
+        ScoreManager.Instance.RecordTurn(currentPatientResponse, nurseMessage);
+    }
+
+    IEnumerator PostRequest()
+    {
+        Debug.Log("Building request body for chat completion...");
+
+        if (currentSpeechSpeed > maxSpeechSpeed)
+        {
+            HandlePatientResponse(lostResponse, 5);
+            yield break;
+        }
+
+        string requestBody = BuildRequestBody();
+        var request = CreateRequest(requestBody);
+
+        yield return request.SendWebRequest();
+
+        if (request.result == UnityWebRequest.Result.ConnectionError || request.result == UnityWebRequest.Result.ProtocolError)
+        {
+            Debug.LogError("Error: " + request.error);
+            Debug.LogError("Response Body: " + request.downloadHandler.text);
+        }
+        else if (request.responseCode == 200)
+        {
+            var jsonResponse = JObject.Parse(request.downloadHandler.text);
+            var messageContent = jsonResponse["choices"][0]["message"]["content"].ToString();
+
+            var match = Regex.Match(messageContent, @"\[(\d+)\]");
+            if (!match.Success || emotionController == null) yield break;
+            int emotionCode = int.Parse(match.Groups[1].Value);
+
+            HandlePatientResponse(messageContent, emotionCode);
+        }
+    }
+
+    private void HandlePatientResponse(string responseText, int emotionCode)
+    {
+        currentPatientResponse = responseText; // for scoring
+
+        chatMessages.Add(new Dictionary<string, string>() { { "role", "assistant" }, { "content", responseText } });
+        PrintChatMessage(chatMessages);
+
+        if (TTSManager.Instance != null)
+        {
+            TTSManager.Instance.ConvertTextToSpeech(responseText);
+        }
+        else
+        {
+            Debug.LogError("TTSManager instance not found.");
+        }
+
+        if (emotionController != null)
+        {
+            emotionController.HandleEmotionCode(emotionCode);
+        }
+    }
+
+    private string BuildRequestBody()
+    {
+        var requestObject = new
+        {
+            // model = "gpt-4-turbo-preview",
+            model = "gpt-4",
+            messages = chatMessages,
+            temperature = 0.7f,
+            //max_tokens = 1500
+        };
+        return JsonConvert.SerializeObject(requestObject);
+    }
+
+    private UnityWebRequest CreateRequest(string requestBody)
+    {
+        var request = new UnityWebRequest(apiUrl, "POST");
+        byte[] bodyRaw = Encoding.UTF8.GetBytes(requestBody);
+        request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+        request.downloadHandler = new DownloadHandlerBuffer();
+        request.SetRequestHeader("Content-Type", "application/json");
+        request.SetRequestHeader("Authorization", "Bearer " + apiKey);
+        return request;
+    }
+
+    public static void PrintChatMessage(List<Dictionary<string, string>> messages)
+    {
+        if (messages.Count == 0)
+            return;
+
+        var latestMessage = messages[messages.Count - 1];
+        string role = latestMessage["role"];
+        string content = latestMessage["content"];
+
+        // Extract emotion code if present
+        string emotionCode = "";
+        var match = Regex.Match(content, @"\[(\d+)\]$");
+        if (match.Success)
+        {
+            emotionCode = $" (Emotion: {match.Groups[1].Value})";
+        }
+
+        Debug.Log($"[{role.ToUpper()}]{emotionCode}\n{content}\n");
+    }
+}
